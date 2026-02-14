@@ -1,0 +1,243 @@
+permissions: {}
+name: OpenClaw Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect build systems
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          has_node=false
+          has_cmake=false
+          has_gradle=false
+          has_maven=false
+
+          node_engine=""
+          node_uses_pnpm=false
+          node_pnpm_lockfile=""
+          node_npm_lockfile=""
+          node_private=false
+          node_name=""
+
+          if [[ -f package.json ]]; then
+            has_node=true
+
+            node_engine="$(python3 - <<'PY'
+          import json
+          try:
+              with open("package.json", "r", encoding="utf-8") as f:
+                  pkg = json.load(f)
+              print((pkg.get("engines") or {}).get("node") or "")
+          except Exception:
+              print("")
+          PY
+            )"
+
+            node_uses_pnpm="$(python3 - <<'PY'
+          import json
+          try:
+              with open("package.json", "r", encoding="utf-8") as f:
+                  pkg = json.load(f)
+              pm = (pkg.get("packageManager") or "")
+              print("true" if pm.startswith("pnpm@") else "false")
+          except Exception:
+              print("false")
+          PY
+            )"
+
+            node_private="$(python3 - <<'PY'
+          import json
+          try:
+              with open("package.json", "r", encoding="utf-8") as f:
+                  pkg = json.load(f)
+              print("true" if bool(pkg.get("private")) else "false")
+          except Exception:
+              print("false")
+          PY
+            )"
+
+            node_name="$(python3 - <<'PY'
+          import json
+          try:
+              with open("package.json", "r", encoding="utf-8") as f:
+                  pkg = json.load(f)
+              print(pkg.get("name") or "")
+          except Exception:
+              print("")
+          PY
+            )"
+
+            [[ -f pnpm-lock.yaml ]] && node_uses_pnpm=true
+            if [[ -f pnpm-lock.yaml ]]; then
+              node_pnpm_lockfile="pnpm-lock.yaml"
+            fi
+            if [[ -f package-lock.json ]]; then
+              node_npm_lockfile="package-lock.json"
+            elif [[ -f npm-shrinkwrap.json ]]; then
+              node_npm_lockfile="npm-shrinkwrap.json"
+            fi
+          fi
+
+          [[ -f CMakeLists.txt ]] && has_cmake=true
+          if [[ -f gradlew || -f build.gradle || -f build.gradle.kts ]]; then
+            has_gradle=true
+          fi
+          if [[ -f mvnw || -f pom.xml ]]; then
+            has_maven=true
+          fi
+
+          {
+            echo "has_node=${has_node}"
+            echo "has_cmake=${has_cmake}"
+            echo "has_gradle=${has_gradle}"
+            echo "has_maven=${has_maven}"
+            echo "node_engine=${node_engine}"
+            echo "node_uses_pnpm=${node_uses_pnpm}"
+            echo "node_pnpm_lockfile=${node_pnpm_lockfile}"
+            echo "node_npm_lockfile=${node_npm_lockfile}"
+            echo "node_private=${node_private}"
+            echo "node_name=${node_name}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Node (pnpm cache)
+        if: ${{ steps.detect.outputs.has_node == 'true' && steps.detect.outputs.node_uses_pnpm == 'true' && steps.detect.outputs.node_pnpm_lockfile != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.detect.outputs.node_engine || '22' }}
+          cache: pnpm
+          cache-dependency-path: ${{ steps.detect.outputs.node_pnpm_lockfile }}
+
+      - name: Setup Node (npm cache)
+        if: ${{ steps.detect.outputs.has_node == 'true' && steps.detect.outputs.node_uses_pnpm != 'true' && steps.detect.outputs.node_npm_lockfile != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.detect.outputs.node_engine || '22' }}
+          cache: npm
+          cache-dependency-path: ${{ steps.detect.outputs.node_npm_lockfile }}
+
+      - name: Setup Node (no cache)
+        if: ${{ steps.detect.outputs.has_node == 'true' && ((steps.detect.outputs.node_uses_pnpm == 'true' && steps.detect.outputs.node_pnpm_lockfile == '') || (steps.detect.outputs.node_uses_pnpm != 'true' && steps.detect.outputs.node_npm_lockfile == '')) }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.detect.outputs.node_engine || '22' }}
+
+      - name: Node build, test, package
+        if: ${{ steps.detect.outputs.has_node == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/install.sh
+          bash scripts/ci/test.sh
+          bash scripts/ci/build.sh
+          bash scripts/ci/package.sh
+
+      - name: CMake build, test, package
+        if: ${{ steps.detect.outputs.has_cmake == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/cmake_build_test.sh
+
+      - name: Setup Java
+        if: ${{ steps.detect.outputs.has_gradle == 'true' || steps.detect.outputs.has_maven == 'true' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Gradle build, test, package
+        if: ${{ steps.detect.outputs.has_gradle == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/gradle_build_test.sh
+
+      - name: Maven build, test, package
+        if: ${{ steps.detect.outputs.has_maven == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/maven_build_test.sh
+
+      - name: Ensure out/ is non-empty
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          if ! find out -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+            echo "No artifacts were produced by any detected build system." > out/NO_ARTIFACTS.txt
+          fi
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" out/* --clobber
+          else
+            gh release create "${tag}" --generate-notes out/*
+          fi
+
+      - name: Publish to npm (OIDC trusted publishing)
+        id: npm_oidc
+        if: ${{ steps.detect.outputs.has_node == 'true' && steps.detect.outputs.node_private != 'true' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "published=false" >> "${GITHUB_OUTPUT}"
+
+          name="${{ steps.detect.outputs.node_name }}"
+          access_args=()
+          if [[ "${name}" == @*/* ]]; then
+            access_args+=(--access public)
+          fi
+
+          echo "==> Attempting npm publish via OIDC"
+          if npm publish --provenance "${access_args[@]}"; then
+            echo "published=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::warning::OIDC npm publish failed; will try NPM_TOKEN if available."
+          fi
+
+      - name: Publish to npm (NPM_TOKEN fallback)
+        if: ${{ steps.detect.outputs.has_node == 'true' && steps.detect.outputs.node_private != 'true' && steps.npm_oidc.outputs.published != 'true' && secrets.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          name="${{ steps.detect.outputs.node_name }}"
+          access_args=()
+          if [[ "${name}" == @*/* ]]; then
+            access_args+=(--access public)
+          fi
+
+          echo "==> Attempting npm publish via NPM_TOKEN"
+          npm publish "${access_args[@]}"
