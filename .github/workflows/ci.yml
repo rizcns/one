@@ -1,0 +1,271 @@
+permissions: {}
+name: OpenClaw CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect:
+    name: Detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      has_node: ${{ steps.detect.outputs.has_node }}
+      has_cmake: ${{ steps.detect.outputs.has_cmake }}
+      has_gradle: ${{ steps.detect.outputs.has_gradle }}
+      has_maven: ${{ steps.detect.outputs.has_maven }}
+      docs_only: ${{ steps.detect.outputs.docs_only }}
+      node_engine: ${{ steps.detect.outputs.node_engine }}
+      node_uses_pnpm: ${{ steps.detect.outputs.node_uses_pnpm }}
+      node_pnpm_lockfile: ${{ steps.detect.outputs.node_pnpm_lockfile }}
+      node_npm_lockfile: ${{ steps.detect.outputs.node_npm_lockfile }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect build systems and docs-only changes
+        id: detect
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          echo "==> Detecting build system files"
+          has_node=false
+          has_cmake=false
+          has_gradle=false
+          has_maven=false
+          docs_only=false
+
+          node_engine=""
+          node_uses_pnpm=false
+          node_pnpm_lockfile=""
+          node_npm_lockfile=""
+
+          if [[ -f package.json ]]; then
+            has_node=true
+
+            node_engine="$(python3 - <<'PY'
+          import json
+          try:
+              with open("package.json", "r", encoding="utf-8") as f:
+                  pkg = json.load(f)
+              print((pkg.get("engines") or {}).get("node") or "")
+          except Exception:
+              print("")
+          PY
+            )"
+
+            node_uses_pnpm="$(python3 - <<'PY'
+          import json
+          try:
+              with open("package.json", "r", encoding="utf-8") as f:
+                  pkg = json.load(f)
+              pm = (pkg.get("packageManager") or "")
+              print("true" if pm.startswith("pnpm@") else "false")
+          except Exception:
+              print("false")
+          PY
+            )"
+            [[ -f pnpm-lock.yaml ]] && node_uses_pnpm=true
+            if [[ -f pnpm-lock.yaml ]]; then
+              node_pnpm_lockfile="pnpm-lock.yaml"
+            fi
+            if [[ -f package-lock.json ]]; then
+              node_npm_lockfile="package-lock.json"
+            elif [[ -f npm-shrinkwrap.json ]]; then
+              node_npm_lockfile="npm-shrinkwrap.json"
+            fi
+          fi
+
+          [[ -f CMakeLists.txt ]] && has_cmake=true
+          if [[ -f gradlew || -f build.gradle || -f build.gradle.kts ]]; then
+            has_gradle=true
+          fi
+          if [[ -f mvnw || -f pom.xml ]]; then
+            has_maven=true
+          fi
+
+          echo "==> Detecting docs-only changes"
+          if [[ -n "${BASE_SHA:-}" && -n "${HEAD_SHA:-}" && "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            # Ensure the SHAs exist locally even when checkout is shallow in the future.
+            git fetch --no-tags --prune --depth=1 origin "${BASE_SHA}" "${HEAD_SHA}" >/dev/null 2>&1 || true
+
+            changed_files="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" || true)"
+            if [[ -n "${changed_files}" ]]; then
+              docs_only=true
+              while IFS= read -r f; do
+                [[ -z "${f}" ]] && continue
+                if [[ "${f}" == docs/* ]]; then
+                  continue
+                fi
+                if [[ "${f}" == README.md || "${f}" == README.* ]]; then
+                  continue
+                fi
+                if [[ "${f}" == *.md || "${f}" == *.mdx ]]; then
+                  continue
+                fi
+                docs_only=false
+                break
+              done <<< "${changed_files}"
+            fi
+          fi
+
+          {
+            echo "has_node=${has_node}"
+            echo "has_cmake=${has_cmake}"
+            echo "has_gradle=${has_gradle}"
+            echo "has_maven=${has_maven}"
+            echo "docs_only=${docs_only}"
+            echo "node_engine=${node_engine}"
+            echo "node_uses_pnpm=${node_uses_pnpm}"
+            echo "node_pnpm_lockfile=${node_pnpm_lockfile}"
+            echo "node_npm_lockfile=${node_npm_lockfile}"
+          } >> "${GITHUB_OUTPUT}"
+
+  node:
+    name: Node
+    needs: detect
+    if: ${{ needs.detect.outputs.has_node == 'true' && needs.detect.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (pnpm cache)
+        if: ${{ needs.detect.outputs.node_uses_pnpm == 'true' && needs.detect.outputs.node_pnpm_lockfile != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ needs.detect.outputs.node_engine || '22' }}
+          cache: pnpm
+          cache-dependency-path: ${{ needs.detect.outputs.node_pnpm_lockfile }}
+
+      - name: Setup Node (npm cache)
+        if: ${{ needs.detect.outputs.node_uses_pnpm != 'true' && needs.detect.outputs.node_npm_lockfile != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ needs.detect.outputs.node_engine || '22' }}
+          cache: npm
+          cache-dependency-path: ${{ needs.detect.outputs.node_npm_lockfile }}
+
+      - name: Setup Node (no cache)
+        if: ${{ (needs.detect.outputs.node_uses_pnpm == 'true' && needs.detect.outputs.node_pnpm_lockfile == '') || (needs.detect.outputs.node_uses_pnpm != 'true' && needs.detect.outputs.node_npm_lockfile == '') }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ needs.detect.outputs.node_engine || '22' }}
+
+      - name: Install
+        shell: bash
+        run: bash scripts/ci/install.sh
+
+      - name: Test
+        shell: bash
+        run: bash scripts/ci/test.sh
+
+      - name: Build
+        shell: bash
+        run: bash scripts/ci/build.sh
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-dist
+          path: dist/**
+          if-no-files-found: warn
+
+  cmake:
+    name: CMake
+    needs: detect
+    if: ${{ needs.detect.outputs.has_cmake == 'true' && needs.detect.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and test
+        shell: bash
+        run: bash scripts/ci/cmake_build_test.sh
+
+      - name: Upload CMake outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-out
+          path: out/**
+          if-no-files-found: warn
+
+  gradle:
+    name: Gradle
+    needs: detect
+    if: ${{ needs.detect.outputs.has_gradle == 'true' && needs.detect.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Build and test
+        shell: bash
+        run: bash scripts/ci/gradle_build_test.sh
+
+      - name: Upload Gradle outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-out
+          path: out/**
+          if-no-files-found: warn
+
+  maven:
+    name: Maven
+    needs: detect
+    if: ${{ needs.detect.outputs.has_maven == 'true' && needs.detect.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Build and test
+        shell: bash
+        run: bash scripts/ci/maven_build_test.sh
+
+      - name: Upload Maven outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: maven-out
+          path: out/**
+          if-no-files-found: warn
